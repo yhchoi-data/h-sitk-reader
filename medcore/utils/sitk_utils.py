@@ -1,7 +1,8 @@
-from typing import Optional, Tuple, Sequence, List, Union
+from typing import Optional, Tuple, Sequence, List, Union, Mapping
 import SimpleITK as sitk
 import numpy as np
 from pathlib import Path
+from ..io.reader import ImageReader
 
 def sitk_write_nii(
     image: Union[sitk.Image, np.ndarray],
@@ -78,7 +79,7 @@ def sitk_write_nii(
 
 def sitk_get_array(
         volume: sitk.Image,
-        norm_min: float = -2000,
+        norm_min: float = -1000,
         norm_max: float = 500,
         normalize: bool = False,
 ) -> np.ndarray:
@@ -322,3 +323,53 @@ def sitk_resample_point_between_volumes(
     mapped_zyx = np.median(np.vstack(idx), axis=1).astype(int).tolist()
     return mapped_zyx
 
+def sitk_read_labelfiles(labelfiles: Mapping[int, Union[str, Path]]) -> sitk.Image:
+    """
+    Read multiple label files and combine them into one UInt8 label volume.
+
+    Parameters
+    ----------
+    labelfiles : mapping
+        Mapping of {label_value: image_path}.
+
+    Returns
+    -------
+    sitk.Image
+        Combined label image (UInt8).
+    """
+    if not labelfiles:
+        raise ValueError("`labelfiles` is empty.")
+
+    reference_path = next(iter(labelfiles.values()))
+    reference_img = ImageReader(str(reference_path)).read()
+
+    combined = sitk.Image(reference_img.GetSize(), sitk.sitkUInt8)
+    combined.CopyInformation(reference_img)
+
+    for label, filepath in labelfiles.items():
+        mask = ImageReader(filepath).read()
+        mask = mask > 0
+        mask = sitk.Cast(mask, sitk.sitkUInt8) * int(label)
+        combined = sitk.Maximum(combined, mask)
+
+    return combined
+
+def sitk_copy_metainfo(volume: sitk.Image, image: np.ndarray) -> sitk.Image:
+    """
+    sitk 이미지 → numpy 처리 → sitk 복원 
+
+    Parameters:
+    -----------
+    sitk_img : SimpleITK.Image
+        입력 이미지
+    image : np.ndarray
+        processed image
+
+    Returns:
+    --------
+    processed_img : SimpleITK.Image
+        처리된 sitk 이미지
+    """
+    processed_volume = sitk.GetImageFromArray(image)
+    processed_volume.CopyInformation(volume)                # 메타데이터 복사
+    return processed_volume

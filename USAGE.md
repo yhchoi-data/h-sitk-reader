@@ -1,222 +1,141 @@
 # Usage
 
-This document describes how to use **h-reader**, a lightweight medical image reader built on top of **SimpleITK** for DICOM and NIfTI workflows.
+This document describes common usage patterns for **medcore**.
 
----
-
-## 1. Basic concepts
-
-- All images are handled as `SimpleITK.Image`
-- Both **DICOM series** and **NIfTI files** are supported
-- Physical space consistency (origin / spacing / direction) is preserved
-- Orientation can be standardized to **LPS** or **RAS**
-
----
-
-## 2. Loading images
-
-### Load a DICOM series
+## 1. Imports
 
 ```python
-from h_sitk_reader import ImageReader
+from medcore.io import ImageReader
 
-vol = ImageReader(
-    "/path/to/dicom_dir",
-).read()
+from medcore.utils import (
+    sitk_get_array,
+    sitk_write_nii,
+    sitk_make_euler3dtransform,
+    sitk_resampler,
+    sitk_read_labelfiles,
+)
 
-print(vol.GetSize())
+from medcore.detect import UmbilicusPredictor, UmbilicusDetector
+from medcore.segment import TorsoSegmenter, AbdomenSegmenter
+from medcore.feature import (
+    compute_label_volumes,
+    compute_label_areas,
+    extract_patches_from_image,
+)
 ```
 
-- Input must be a directory containing a single / multiple DICOM series
-- Slices are automatically sorted
-
----
-
-### Load a NIfTI file
+## 2. Load image (DICOM / NIfTI)
 
 ```python
-from h_sitk_reader import ImageReader
+from medcore.io import ImageReader
 
-vol = ImageReader(
-    "/path/to/image.nii.gz",
-).read()
-
-print(vol.GetSize())
+vol = ImageReader("/path/to/image.nii.gz").read()
+print(vol.GetSize(), vol.GetSpacing())
 ```
-
-Supported formats:
-- `.nii`
-- `.nii.gz`
-
----
-
-## 3. Orientation standardization
-
-Medical images often come with inconsistent orientation conventions.  
-`h-reader` allows explicit conversion.
-
-### Convert to RAS (default: LPS)
 
 ```python
-vol_ras = ImageReader(
-    "/path/to/image.nii.gz",
-    target_orientation="RAS"
-).read()
+vol = ImageReader("/path/to/dicom_dir").read()
 ```
 
-Notes:
-- Orientation conversion updates **direction**, **origin**, and **spacing** consistently
-- Internally relies on SimpleITK physical space conventions
-
----
-
-## 4. Get Array From Image
-
-Converts a `SimpleITK.Image` into a NumPy array.  
-Optionally, CT image intensities (HU) can be normalized to the `[0, 1]` range.
+## 3. Convert to NumPy and normalize
 
 ```python
-from h_sitk_reader import ImageReader, sitk_get_array
+from medcore.utils import sitk_get_array
 
-vol = ImageReader(
-    "/path/to/image.nii.gz",
-).read()
-img = sitk_get_array(
-    vol
-)
-img_norm = sitk_get_array(
-    vol,
-    normalize = True,
-    norm_min = -500,
-    norm_max = 2000
-)
-print(img.shape, img.min(), img.max())
-print(img_norm.shape, img_norm.min(), img_norm.max())
+arr = sitk_get_array(vol)  # raw array
+arr_norm = sitk_get_array(vol, normalize=True, norm_min=-500, norm_max=2000)
 ```
 
----
-
-## 5. Create Euler3D transform (physical space)
-
-Creates a Euler3DTransform centered at the **physical center of the reference image.**
+## 4. Resampling and transforms
 
 ```python
-from h_sitk_reader import ImageReader, sitk_make_euler3dtransform
+from medcore.utils import sitk_make_euler3dtransform, sitk_resampler
 
-vol = ImageReader(
-    "/path/to/image.nii.gz",
-).read()
-tfm = sitk_make_euler3dtransform(
-    vol, 
-    rotation_deg = 15, 
-    axis='x'
-)
+tfm = sitk_make_euler3dtransform(vol, rotation_deg=15, axis="x")
+vol_rot = sitk_resampler(vol, transform=tfm, interpolation="linear")
+vol_iso = sitk_resampler(vol, new_spacing=(1.0, 1.0, 1.0))
 ```
----
 
-## 5. Resampler
-
-Images can be resampled to a target spacing. 
-Or Arbitrary SimpleITK transforms can be applied.
+## 5. Save NIfTI
 
 ```python
-from h_reader import ImageReader, sitk_make_euler3dtransform, sitk_resampler
+from medcore.utils import sitk_write_nii, sitk_get_array
 
-vol = ImageReader(
-    "/path/to/image.nii.gz",
-).read()
-tfm = sitk_make_euler3dtransform(
-    vol, 
-    rotation_deg = 15, 
-    axis='x'
-)
-
-vol_rsl_tfm = sitk_resampler(
-    vol, 
-    transform = tfm
-)
-
-vol_rsl = sitk_resampler(
-    img,
-    new_spacing=(1.0, 1.0, 1.0),
-    interpolation="linear"
-)
-
+img = sitk_get_array(vol)
+# ... processing ...
+sitk_write_nii(vol, "/path/to/out_volume.nii.gz")
+sitk_write_nii(img, "/path/to/out_array.nii.gz", reference=vol)
 ```
 
-Available interpolators:
-- `"nearest"`
-- `"linear"`
-- `"bspline"`
-
----
-
-## 6. Convert Dicom to NIfTI
-
-Dicoms can be converted to NIfTI file. 
+## 6. Segmentation
 
 ```python
-from h_sitk_reader import ImageReader
+from medcore.segment import TorsoSegmenter, AbdomenSegmenter
 
-reader = ImageReader(
-    "/path/to/dicom_dir",
-)
-reader.to_nifti("/path/to/dicom_dir/nifti.nii.gz")
+torso_seg = TorsoSegmenter()
+torso_mask, torso_contour, torso_smooth = torso_seg.segment(arr_norm)
 
+abd_seg = AbdomenSegmenter()
+abdominal_image, abdomen_mask, abdomen_contour = abd_seg.segment(arr_norm)
 ```
-- Output preserves physical metadata
-- Suitable for downstream ML pipelines
 
----
-
-## 7. Save NIfTI file
-Images (SimpleITK or nd.array) can be saved as a NIfTI file.
+## 7. Detection
 
 ```python
-from h_sitk_reader import ImageReader, sitk_write_nii
+from medcore.detect import UmbilicusPredictor
 
-vol = ImageReader(
-    "/path/to/image.nii.gz",
-).read()
-img = sitk_get_array(
-    vol
+predictor = UmbilicusPredictor()
+point_xyz = predictor.predict(arr, spacing=vol.GetSpacing())
+print(point_xyz)
+```
+
+```python
+from medcore.detect import UmbilicusDetector
+
+detector = UmbilicusDetector()
+points_df = detector.detect(
+    region_image=abdominal_image,
+    region_mask=abdomen_mask,
+    region_contour=abd_seg.contour_info,
+    region_info=abd_seg.abdomen_region,
 )
-
-# processing ...... > out_vol or out_img
-sitk_write_nii(out_vol, "/path/to/out.nii.gz")
-sitk_write_nii(out_img, "/path/to/out.nii.gz", reference=vol)
+print(points_df.head())
 ```
 
----
+## 8. Feature extraction
 
-## 8. Notes and limitations
+```python
+from medcore.feature import compute_label_volumes, compute_label_areas
 
-- All operations assume a **single-volume image**
-- DICOM RTSTRUCT is not handled directly (yet)
-- Designed for research and preprocessing pipelines (Medical Imaging)
+labelfiles = {
+    1: "/path/to/muscle.nii.gz",
+    2: "/path/to/fat.nii.gz",
+}
 
----
-
-## 9. Installation
-
-### From PyPI
-
-```bash
-pip install h-sitk-reader
+volumes_cm3 = compute_label_volumes(labelfiles)
+areas_cm2 = compute_label_areas(labelfiles, slices_index=100)
+print(volumes_cm3)
+print(areas_cm2)
 ```
 
-### From source
+```python
+from medcore.feature import extract_patches_from_image
 
-```bash
-git clone <repository-url>
-cd h-sitk-reader
-pip install .
+# points: (N, 3), commonly 25 points for 5x5 grid
+patches = extract_patches_from_image(points, vol, patch_size=50, middle_size=50, delta=25)
+print(patches.shape)
 ```
 
----
+## 9. Label merge utility
 
-## 10. Requirements
+```python
+from medcore.utils import sitk_read_labelfiles
 
-- Python >= 3.8
-- SimpleITK
+merged = sitk_read_labelfiles(labelfiles)  # labels merged into one UInt8 volume
+```
 
+## 10. Notes
+
+- `medcore.segment` import is supported directly:
+  - `from medcore.segment import TorsoSegmenter`
+- `compute_label_volumns` is still available as a backward-compatible alias of `compute_label_volumes`.
