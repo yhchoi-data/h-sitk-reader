@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="medcore",
-    version="1.1.0",
+    version="1.2.0",
     description="Medical imaging utilities based on SimpleITK",
     long_description=open("README.md", "r", encoding="utf-8").read() if __import__("os").path.exists("README.md") else "",
     long_description_content_type="text/markdown",

@@ -55,6 +55,8 @@ class ImageReader:
         self.max_slice_thickness_mm = max_slice_thickness_mm
         self.read_all_acquisitions = read_all_acquisitions
         self.read_all_series = read_all_series
+        self._series_files_cache: Dict[str, List[str]] = {}
+        self._dicom_meta_cache: Dict[str, Dict[str, Any]] = {}
 
         self.sitk_volume = self.load_medical_image(self.input_path)
 
@@ -139,10 +141,20 @@ class ImageReader:
         denom = (norm_max - norm_min) if (norm_max - norm_min) != 0 else 1.0
         return (img - norm_min) / denom
 
-    def get_metadata(self) -> pd.DataFrame:
+    def get_metadata(self, as_dict: bool = False) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
         """
         Extract metadata keys stored in the SimpleITK image (best-effort).
         Supports single image or dict (series/acquisition) outputs.
+
+        Parameters
+        ----------
+        as_dict : bool, default=False
+            - False: return one merged DataFrame (existing behavior).
+            - True: return dict[source_key, DataFrame].
+              source_key examples:
+              - "image" (single volume)
+              - "series_uid"
+              - "series_uid:acquisition_key"
         """
 
         def _rows_from_image(img: sitk.Image, source: str | None) -> List[Dict[str, Any]]:
@@ -167,17 +179,31 @@ class ImageReader:
             return rows
 
         rows: List[Dict[str, Any]] = []
+        rows_by_source: Dict[str, List[Dict[str, Any]]] = {}
 
         if isinstance(self.sitk_volume, dict):
             for k, v in self.sitk_volume.items():
                 if isinstance(v, dict):
                     for kk, vv in v.items():
-                        rows.extend(_rows_from_image(vv, f"{k}:{kk}"))
+                        if not isinstance(vv, sitk.Image):
+                            continue
+                        src = f"{k}:{kk}"
+                        src_rows = _rows_from_image(vv, src)
+                        rows.extend(src_rows)
+                        rows_by_source[src] = src_rows
                 else:
-                    rows.extend(_rows_from_image(v, str(k)))
+                    if not isinstance(v, sitk.Image):
+                        continue
+                    src = str(k)
+                    src_rows = _rows_from_image(v, src)
+                    rows.extend(src_rows)
+                    rows_by_source[src] = src_rows
         else:
             rows = _rows_from_image(self.sitk_volume, None)
+            rows_by_source["image"] = rows
 
+        if as_dict:
+            return {k: pd.DataFrame(v) for k, v in rows_by_source.items()}
         return pd.DataFrame(rows)
 
     # -------------------------
@@ -320,7 +346,7 @@ class ImageReader:
         if self.read_all_series:
             images = {}
             for sid in series_ids:
-                files = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(folder), sid)
+                files = self._get_series_files_cached(folder, sid)
                 files = self._filter_files_by_iop_thickness(files)
                 if not files:
                     continue
@@ -335,6 +361,7 @@ class ImageReader:
                                 reader.MetaDataDictionaryArrayUpdateOn()
                                 reader.LoadPrivateTagsOff()
                                 img = reader.Execute()
+                                self._copy_metadata_from_series_reader(reader, img)
                                 images[sid][acq] = img
                             except Exception as e:
                                 if self.verbose:
@@ -347,6 +374,7 @@ class ImageReader:
                         reader.MetaDataDictionaryArrayUpdateOn()
                         reader.LoadPrivateTagsOff()
                         img = reader.Execute()
+                        self._copy_metadata_from_series_reader(reader, img)
                         images[sid] = img
                 except Exception as e:
                     if self.verbose:
@@ -394,16 +422,7 @@ class ImageReader:
                     raise RuntimeError(str(e))
 
                 # Optionally copy representative per-slice metadata into image metadata
-                try:
-                    if reader.GetMetaDataDictionaryArraySize() > 0:
-                        md0 = reader.GetMetaDataDictionaryArray()[0]
-                        for k in md0.GetKeys():
-                            try:
-                                img.SetMetaData(k, md0[k])
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                self._copy_metadata_from_series_reader(reader, img)
 
                 images[acq] = img
 
@@ -436,18 +455,42 @@ class ImageReader:
             raise RuntimeError(str(e))
 
         # Optionally copy representative per-slice metadata into image metadata
+        self._copy_metadata_from_series_reader(reader, img)
+
+        return img
+
+    @staticmethod
+    def _copy_metadata_from_series_reader(
+        reader: sitk.ImageSeriesReader,
+        image: sitk.Image,
+        slice_index: int = 0,
+    ) -> None:
+        """
+        Copy metadata from a representative slice in ImageSeriesReader to image-level metadata.
+        Works more consistently across SITK versions than relying only on dictionary-array APIs.
+        """
+        try:
+            keys = reader.GetMetaDataKeys(slice_index)
+            for key in keys:
+                try:
+                    image.SetMetaData(key, reader.GetMetaData(slice_index, key))
+                except Exception:
+                    pass
+            return
+        except Exception:
+            pass
+
+        # Fallback for environments where GetMetaDataKeys/GetMetaData is unavailable.
         try:
             if reader.GetMetaDataDictionaryArraySize() > 0:
-                md0 = reader.GetMetaDataDictionaryArray()[0]
+                md0 = reader.GetMetaDataDictionaryArray()[slice_index]
                 for k in md0.GetKeys():
                     try:
-                        img.SetMetaData(k, md0[k])
+                        image.SetMetaData(k, md0[k])
                     except Exception:
                         pass
         except Exception:
             pass
-
-        return img
 
     # -------------------------
     # DICOM series selection (filter + scoring)
@@ -458,7 +501,7 @@ class ImageReader:
         candidates = []
 
         for sid in series_ids:
-            files = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(folder), sid)
+            files = self._get_series_files_cached(folder, sid)
             if not files:
                 continue
 
@@ -511,7 +554,7 @@ class ImageReader:
             # number of files (soft, scaled)
             score += min(len(files), 500) / 5.0
 
-            candidates.append((score, len(files), sid, files, meta))
+            candidates.append((score, len(files), sid, meta))
 
         if not candidates:
             return None
@@ -520,7 +563,7 @@ class ImageReader:
         best = candidates[0]
 
         if self.verbose:
-            score, nfiles, sid, _, meta = best
+            score, nfiles, sid, meta = best
             print("[DICOM] Selected series:")
             print(f"  SeriesInstanceUID: {sid}")
             print(f"  Score: {score:.2f}, Files: {nfiles}")
@@ -530,7 +573,15 @@ class ImageReader:
             print(f"  SliceThickness: {meta.get('SliceThickness')}")
             print(f"  SpacingBetweenSlices: {meta.get('SpacingBetweenSlices')}")
 
-        return best[3]
+        return self._get_series_files_cached(folder, best[2])
+
+    def _get_series_files_cached(self, folder: Path, sid: str) -> List[str]:
+        key = f"{str(folder)}::{sid}"
+        if key in self._series_files_cache:
+            return self._series_files_cache[key]
+        files = sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(folder), sid)
+        self._series_files_cache[key] = files
+        return files
 
     def _group_files_by_acquisition(self, files: List[str]) -> Dict[str, List[str]]:
         groups: Dict[str, List[tuple[float, str]]] = {}
@@ -615,6 +666,8 @@ class ImageReader:
         """
         Read minimal DICOM tags (without pixels) for series selection.
         """
+        if dcm_path in self._dicom_meta_cache:
+            return self._dicom_meta_cache[dcm_path]
         try:
             ds = pydicom.dcmread(dcm_path, stop_before_pixels=True, force=True)
         except Exception:
@@ -633,7 +686,7 @@ class ImageReader:
             except Exception:
                 return None
 
-        return {
+        meta = {
             "Modality": get_str("Modality"),
             "SeriesDescription": get_str("SeriesDescription"),
             "BodyPartExamined": get_str("BodyPartExamined"),
@@ -642,6 +695,8 @@ class ImageReader:
             "SliceThickness": get_float("SliceThickness"),
             "SpacingBetweenSlices": get_float("SpacingBetweenSlices"),
         }
+        self._dicom_meta_cache[dcm_path] = meta
+        return meta
 
     # -------------------------
     # Orientation standardization
